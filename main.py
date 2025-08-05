@@ -80,3 +80,6 @@ while True:
         time.sleep(60)  # Avoid repeat within the same minute
     else:
         time.sleep(30)
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=8080)
