@@ -1,6 +1,3 @@
-flask
-requests
-persiantools
-pytz
 python-telegram-bot==13.15
-schedule
+apscheduler==3.10.4
+python-dotenv==1.0.1
