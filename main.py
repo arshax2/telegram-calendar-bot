@@ -13,7 +13,7 @@ import telegram
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")  # e.g., "@yourchannel" or channel ID as string
 POST_HOUR = 11
-POST_MINUTE = 15
+POST_MINUTE = 30
 
 # Logging
 logging.basicConfig(level=logging.INFO)
