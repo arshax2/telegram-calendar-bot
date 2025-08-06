@@ -1,78 +1,111 @@
+"""
+Telegram Calendar Bot
+• Sends today’s Shamsi / Miladi / Hijri date (and holidays) to a list of channels
+• Stays alive on Fly.io by exposing a tiny Flask web-server on PORT (8080 by default)
+"""
+
 import os
+import threading
 import time
+from datetime import datetime
+
 import pytz
 import requests
-from datetime import datetime
+from flask import Flask
 from persiantools.jdatetime import JalaliDate
-from keep_alive import keep_alive
 
-# ─── CONFIG ───
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ────────────────────────────
+# CONFIG
+# ────────────────────────────
+BOT_TOKEN   = os.getenv("BOT_TOKEN")              # set with: fly secrets set BOT_TOKEN=123:ABC…
 CHANNEL_IDS = ["@as1signal", "@armandoviz", "@WWForex2008"]
-POST_HOUR = 11
-POST_MINUTE = 59
-TIMEZONE = pytz.timezone("Europe/Istanbul")
 
-# ─── Build today's formatted message ───
-def get_today_info():
-    now = datetime.now(TIMEZONE)
-    miladi = now.strftime("%-d %B %Y")
+POST_HOUR   = 12                                  # Istanbul time
+POST_MINUTE = 15
+TIMEZONE    = pytz.timezone("Europe/Istanbul")
 
-    shamsi = JalaliDate(now)
-    weekday_str = shamsi.strftime('%A')
-    shamsi_str = f"{shamsi.day} {shamsi.strftime('%B')} {shamsi.year}"
+PORT        = int(os.getenv("PORT", 8080))        # Fly.io sets $PORT automatically
+
+# ────────────────────────────
+# FLASK “keep-alive” ENDPOINT
+# ────────────────────────────
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "✅ Telegram-calendar-bot is running"
+
+# ────────────────────────────
+# MESSAGE BUILDERS
+# ────────────────────────────
+def build_today_message() -> str:
+    now      = datetime.now(TIMEZONE)
+    miladi   = now.strftime("%-d %B %Y")
+
+    shamsi   = JalaliDate(now)
+    weekday  = shamsi.strftime('%A')
+    shamsi_s = f"{shamsi.day} {shamsi.strftime('%B')} {shamsi.year}"
     shamsi_key = f"{shamsi.year}-{shamsi.month:02d}-{shamsi.day:02d}"
 
-    hejri = requests.get(f"https://api.keybit.ir/convert/date?date={shamsi_key}").json()
-    hejri_str = hejri["result"]["hijri"]["date"]
+    hejri    = requests.get(f"https://api.keybit.ir/convert/date?date={shamsi_key}").json()
+    hejri_s  = hejri["result"]["hijri"]["date"]
 
-    message = f"""📆 **تاریخ امروز – {weekday_str}**
+    msg = (
+        f"📆 **تاریخ امروز – {weekday}**\n\n"
+        f"☀️ **شمسی:** `{shamsi_s}`\n"
+        f"📅 **میلادی:** `{miladi}`\n"
+        f"🌙 **قمری:** `{hejri_s}`"
+    )
 
-☀️ **شمسی:** `{shamsi_str}`
-📅 **میلادی:** `{miladi}`
-🌙 **قمری:** `{hejri_str}`"""
-
+    # check for official holidays / descriptions
     try:
-        response = requests.get(f"https://api.keybit.ir/date?date={shamsi_key}")
-        if response.status_code == 200:
-            result = response.json().get("result", {})
-            desc = result.get("description")
-            is_holiday = result.get("holiday", False)
-
+        r = requests.get(f"https://api.keybit.ir/date?date={shamsi_key}")
+        if r.ok:
+            res        = r.json().get("result", {})
+            desc       = res.get("description")
+            is_holiday = res.get("holiday", False)
             if desc:
-                message += f"\n\n🎉 **مناسبت:** {desc}"
+                msg += f"\n\n🎉 **مناسبت:** {desc}"
             if is_holiday:
-                message += f"\n⛱ تعطیل رسمی است"
-    except Exception as e:
-        print(f"⚠️ Error fetching calendar: {e}")
+                msg += "\n⛱ تعطیل رسمی است"
+    except Exception as err:
+        print("⚠️  Calendar API error:", err)
 
-    return message
+    return msg
 
-# ─── Send to all channels ───
-def send_to_telegram(text):
+def broadcast(text: str):
     for chat_id in CHANNEL_IDS:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown"
-        }
         try:
-            r = requests.post(url, json=payload)
-            print(f"✅ Sent to {chat_id}: {r.status_code}")
-        except Exception as e:
-            print(f"❌ Failed to send to {chat_id}: {e}")
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            r   = requests.post(url, json={"chat_id": chat_id,
+                                           "text": text,
+                                           "parse_mode": "Markdown"})
+            print(f"→ {chat_id}: {r.status_code}")
+        except Exception as err:
+            print(f"✖️  Couldn’t send to {chat_id}: {err}")
 
-# ─── Start web server ───
-keep_alive()
+# ────────────────────────────
+# SCHEDULER THREAD
+# ────────────────────────────
+def poster_loop():
+    while True:
+        now = datetime.now(TIMEZONE)
+        if now.hour == POST_HOUR and now.minute == POST_MINUTE:
+            print("📤 Posting today’s calendar …")
+            broadcast(build_today_message())
+            time.sleep(60)          # wait a minute so we don’t double-post
+        else:
+            time.sleep(20)
 
-# ─── Daily Loop ───
-while True:
-    now = datetime.now(TIMEZONE)
-    if now.hour == POST_HOUR and now.minute == POST_MINUTE:
-        print("📤 Posting today's date...")
-        msg = get_today_info()
-        send_to_telegram(msg)
-        time.sleep(60)
-    else:
-        time.sleep(30)
+# ────────────────────────────
+# ENTRY-POINT
+# ────────────────────────────
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable not set!")
+
+    # start the poster thread
+    threading.Thread(target=poster_loop, daemon=True).start()
+
+    # run Flask in the main thread (health-checks succeed -> no restarts)
+    app.run(host="0.0.0.0", port=PORT)
