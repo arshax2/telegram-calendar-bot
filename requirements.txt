@@ -2,3 +2,5 @@ flask
 requests
 persiantools
 pytz
+python-telegram-bot==13.15
+schedule
