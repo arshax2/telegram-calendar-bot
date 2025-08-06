@@ -1,7 +1,7 @@
 """
 Telegram Calendar Bot
-• Sends today’s Shamsi / Miladi / Hijri date (and holidays) to a list of channels
-• Stays alive on Fly.io by exposing a tiny Flask web-server on PORT (8080 by default)
+Posts today’s Shamsi / Miladi / Hijri date (plus holiday info) to TG channels.
+Robust against API failures, keeps scheduler alive, and friendly to Fly.io.
 """
 
 import os
@@ -14,98 +14,111 @@ import requests
 from flask import Flask
 from persiantools.jdatetime import JalaliDate
 
-# ────────────────────────────
-# CONFIG
-# ────────────────────────────
-BOT_TOKEN   = os.getenv("BOT_TOKEN")              # set with: fly secrets set BOT_TOKEN=123:ABC…
+# ───────────────────────────
+# CONFIGURATION
+# ───────────────────────────
+BOT_TOKEN   = os.getenv("BOT_TOKEN")          # fly secrets set BOT_TOKEN=123:ABC…
 CHANNEL_IDS = ["@as1signal", "@armandoviz", "@WWForex2008"]
 
-POST_HOUR   = 12                                  # Istanbul time
-POST_MINUTE = 15
-TIMEZONE    = pytz.timezone("Europe/Istanbul")
+POST_HOUR   = 12                              # Europe/Istanbul time
+POST_MINUTE = 45
+TZ          = pytz.timezone("Europe/Istanbul")
 
-PORT        = int(os.getenv("PORT", 8080))        # Fly.io sets $PORT automatically
+PORT        = int(os.getenv("PORT", 8080))    # Fly injects $PORT
+HTTP_TIMEOUT = 6                              # seconds
 
-# ────────────────────────────
-# FLASK “keep-alive” ENDPOINT
-# ────────────────────────────
+# ───────────────────────────
+# FLASK health-check
+# ───────────────────────────
 app = Flask(__name__)
 
 @app.route("/")
 def index():
     return "✅ Telegram-calendar-bot is running"
 
-# ────────────────────────────
-# MESSAGE BUILDERS
-# ────────────────────────────
+# ───────────────────────────
+# UTILITIES
+# ───────────────────────────
+def safe_get_json(url: str):
+    """GET url ➜ json or None (never raises)."""
+    try:
+        r = requests.get(url, timeout=HTTP_TIMEOUT)
+        return r.json() if r.ok else None
+    except Exception as e:
+        print(f"⚠️  GET {url} failed:", e)
+        return None
+
 def build_today_message() -> str:
-    now      = datetime.now(TIMEZONE)
-    miladi   = now.strftime("%-d %B %Y")
+    now = datetime.now(TZ)
+    miladi = now.strftime("%-d %B %Y")
 
-    shamsi   = JalaliDate(now)
-    weekday  = shamsi.strftime('%A')
-    shamsi_s = f"{shamsi.day} {shamsi.strftime('%B')} {shamsi.year}"
-    shamsi_key = f"{shamsi.year}-{shamsi.month:02d}-{shamsi.day:02d}"
+    shamsi      = JalaliDate(now)
+    weekday_fa  = shamsi.strftime('%A')
+    shamsi_s    = f"{shamsi.day} {shamsi.strftime('%B')} {shamsi.year}"
+    key         = f"{shamsi.year}-{shamsi.month:02d}-{shamsi.day:02d}"
 
-    hejri    = requests.get(f"https://api.keybit.ir/convert/date?date={shamsi_key}").json()
-    hejri_s  = hejri["result"]["hijri"]["date"]
+    hejri_s = "نامشخص"
+    hijri_api = safe_get_json(f"https://api.keybit.ir/convert/date?date={key}")
+    if hijri_api and hijri_api.get("result"):
+        hejri_s = hijri_api["result"]["hijri"]["date"]
 
     msg = (
-        f"📆 **تاریخ امروز – {weekday}**\n\n"
+        f"📆 **تاریخ امروز – {weekday_fa}**\n\n"
         f"☀️ **شمسی:** `{shamsi_s}`\n"
         f"📅 **میلادی:** `{miladi}`\n"
         f"🌙 **قمری:** `{hejri_s}`"
     )
 
-    # check for official holidays / descriptions
-    try:
-        r = requests.get(f"https://api.keybit.ir/date?date={shamsi_key}")
-        if r.ok:
-            res        = r.json().get("result", {})
-            desc       = res.get("description")
-            is_holiday = res.get("holiday", False)
-            if desc:
-                msg += f"\n\n🎉 **مناسبت:** {desc}"
-            if is_holiday:
-                msg += "\n⛱ تعطیل رسمی است"
-    except Exception as err:
-        print("⚠️  Calendar API error:", err)
+    # Optional holiday info
+    info_api = safe_get_json(f"https://api.keybit.ir/date?date={key}")
+    if info_api and info_api.get("result"):
+        res = info_api["result"]
+        if res.get("description"):
+            msg += f"\n\n🎉 **مناسبت:** {res['description']}"
+        if res.get("holiday"):
+            msg += "\n⛱ امروز تعطیل رسمی است"
 
     return msg
 
 def broadcast(text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     for chat_id in CHANNEL_IDS:
         try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            r   = requests.post(url, json={"chat_id": chat_id,
-                                           "text": text,
-                                           "parse_mode": "Markdown"})
-            print(f"→ {chat_id}: {r.status_code}")
-        except Exception as err:
-            print(f"✖️  Couldn’t send to {chat_id}: {err}")
+            r = requests.post(
+                url,
+                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                timeout=HTTP_TIMEOUT
+            )
+            if r.status_code != 200:
+                print(f"✖️  TG error {r.status_code} for {chat_id}: {r.text[:120]}")
+            else:
+                print(f"→ Sent to {chat_id}")
+        except Exception as e:
+            print(f"✖️  Couldn’t send to {chat_id}: {e}")
 
-# ────────────────────────────
-# SCHEDULER THREAD
-# ────────────────────────────
+# ───────────────────────────
+# SCHEDULER (never dies)
+# ───────────────────────────
 def poster_loop():
     while True:
-        now = datetime.now(TIMEZONE)
-        if now.hour == POST_HOUR and now.minute == POST_MINUTE:
-            print("📤 Posting today’s calendar …")
-            broadcast(build_today_message())
-            time.sleep(60)          # wait a minute so we don’t double-post
-        else:
-            time.sleep(20)
+        try:
+            now = datetime.now(TZ)
+            if now.hour == POST_HOUR and now.minute == POST_MINUTE:
+                print("📤 Posting today’s calendar …")
+                broadcast(build_today_message())
+                time.sleep(60)      # avoid duplicates
+            else:
+                time.sleep(20)
+        except Exception as e:
+            # Log and keep looping
+            print("💥 Scheduler crash:", e)
 
-# ────────────────────────────
-# ENTRY-POINT
-# ────────────────────────────
+# ───────────────────────────
+# MAIN
+# ───────────────────────────
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable not set!")
+        raise RuntimeError("BOT_TOKEN secret missing!")
 
-    # start the poster thread
     threading.Thread(target=poster_loop, daemon=True).start()
-
-    # run Flask in the main thread (health-checks succeed -> no restarts)
     app.run(host="0.0.0.0", port=PORT)
